@@ -1,19 +1,14 @@
-use std::io::Read;
-use std::net::SocketAddr;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 
 #[derive(Parser)]
 #[command(
@@ -27,168 +22,92 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the credential proxy server.
+    /// Start the credential proxy on a Unix socket.
     ///
-    /// Runs an HTTP server on localhost that serves your current AWS credentials
-    /// in the ECS container credential format. Configure the Nix daemon to use
-    /// AWS_CONTAINER_CREDENTIALS_FULL_URI pointing to this server.
+    /// Listens for connections, verifies the peer UID via SO_PEERCRED (only
+    /// root and the socket owner are allowed), then returns the current AWS
+    /// credentials in credential_process JSON format.
     ///
-    /// An authorization token is always required. If not provided via --auth-token
-    /// or AWS_NIX_CACHE_AUTH_TOKEN, one is auto-generated and saved to the token file.
-    /// Only processes that know the token (the Nix daemon) can fetch credentials.
+    /// Security: access is enforced at the kernel level — no tokens, no HTTP.
+    /// The socket is created with mode 0660 inside a 0700 directory under
+    /// $XDG_RUNTIME_DIR, so only the owner and root (nix-daemon) can connect.
     Serve {
-        /// Address to bind to. MUST be a loopback address (127.0.0.1 or [::1]).
-        /// Binding to non-loopback addresses is refused to prevent credential exposure.
-        #[arg(long, default_value = "127.0.0.1:23456")]
-        bind: SocketAddr,
+        /// Path to the Unix socket.
+        /// Defaults to $XDG_RUNTIME_DIR/aws-nix-cache/credentials.sock
+        #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
+        socket: Option<PathBuf>,
+    },
 
-        /// Authorization token for request authentication.
-        /// If omitted, a secure random token is auto-generated and saved to --token-file.
-        /// The Nix daemon must send this token via AWS_CONTAINER_AUTHORIZATION_TOKEN.
-        #[arg(long, env = "AWS_NIX_CACHE_AUTH_TOKEN")]
-        auth_token: Option<String>,
-
-        /// Path to store/read the auth token. Defaults to $XDG_RUNTIME_DIR/aws-nix-cache/token
-        /// (typically /run/user/$UID/aws-nix-cache/token). Created with mode 0600.
-        #[arg(long, env = "AWS_NIX_CACHE_TOKEN_FILE")]
-        token_file: Option<PathBuf>,
+    /// Fetch credentials from the proxy (used as AWS credential_process).
+    ///
+    /// Connects to the Unix socket, reads credential_process JSON, and prints
+    /// it to stdout. Configure this in the Nix daemon's AWS config:
+    ///
+    ///   [default]
+    ///   credential_process = aws-nix-cache fetch
+    Fetch {
+        /// Path to the Unix socket.
+        #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
+        socket: Option<PathBuf>,
     },
 
     /// Validate current AWS credentials and print caller identity.
     Check,
 
-    /// Print environment configuration for the Nix daemon.
-    ///
-    /// Reads the auth token from --auth-token or the token file.
-    /// Run `aws-nix-cache serve` first to generate the token.
+    /// Print configuration for the Nix daemon.
     PrintEnv {
-        /// Address the proxy listens on
-        #[arg(long, default_value = "127.0.0.1:23456")]
-        bind: SocketAddr,
-
-        /// Authorization token. If omitted, reads from the token file.
-        #[arg(long, env = "AWS_NIX_CACHE_AUTH_TOKEN")]
-        auth_token: Option<String>,
-
-        /// Path to the auth token file.
-        #[arg(long, env = "AWS_NIX_CACHE_TOKEN_FILE")]
-        token_file: Option<PathBuf>,
+        /// Path to the Unix socket.
+        #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
+        socket: Option<PathBuf>,
     },
 }
 
-struct AppState {
-    sdk_config: aws_config::SdkConfig,
-    auth_token: String,
-}
-
-/// ECS-compatible credential response.
-/// The AWS SDK expects exactly this JSON shape when using
-/// AWS_CONTAINER_CREDENTIALS_FULL_URI.
+/// AWS credential_process JSON format (Version 1).
+/// The AWS SDK invokes `credential_process`, reads stdout, and parses this.
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct CredentialResponse {
+struct CredentialProcessResponse {
+    version: u32,
     access_key_id: String,
     secret_access_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    token: Option<String>,
+    session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expiration: Option<String>,
 }
 
-// ── Security helpers ─────────────────────────────────────────────────────
+// ── Paths & permissions ──────────────────────────────────────────────────
 
-fn default_token_path() -> PathBuf {
+fn default_socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         // /run/user/$UID — tmpfs, per-user, mode 0700 on systemd systems
         PathBuf::from(runtime_dir)
             .join("aws-nix-cache")
-            .join("token")
+            .join("credentials.sock")
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(".aws-nix-cache").join("token")
+        PathBuf::from(home)
+            .join(".aws-nix-cache")
+            .join("credentials.sock")
     }
 }
 
-fn generate_token() -> anyhow::Result<String> {
-    let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn save_token(path: &Path, token: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
+fn ensure_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
-        // Directory: owner-only access (0700)
+        // Owner-only traversal (0700) — other users can't even list the directory
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
-    // File: owner-only read/write (0600) — root can still read (CAP_DAC_OVERRIDE)
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    std::fs::write(path, token)?;
+    // Remove stale socket from a previous run
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)?;
+    }
     Ok(())
 }
 
-fn load_token(path: &Path) -> anyhow::Result<String> {
-    let token = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read token file {}: {e}", path.display()))?
-        .trim()
-        .to_string();
-    anyhow::ensure!(!token.is_empty(), "token file {} is empty", path.display());
-    Ok(token)
-}
-
-/// Resolve the auth token: explicit > file > auto-generate.
-fn resolve_token(
-    auth_token: Option<String>,
-    token_file: Option<PathBuf>,
-    generate_if_missing: bool,
-) -> anyhow::Result<String> {
-    // 1. Explicit token takes priority
-    if let Some(token) = auth_token {
-        return Ok(token);
-    }
-
-    let path = token_file.unwrap_or_else(default_token_path);
-
-    // 2. Try to read from file
-    if path.exists() {
-        match load_token(&path) {
-            Ok(token) => {
-                tracing::info!(path = %path.display(), "loaded auth token from file");
-                return Ok(token);
-            }
-            Err(e) => {
-                tracing::warn!("failed to load token from {}: {e}", path.display());
-            }
-        }
-    }
-
-    // 3. Auto-generate if allowed
-    if generate_if_missing {
-        let token = generate_token()?;
-        save_token(&path, &token)?;
-        tracing::info!(path = %path.display(), "generated new auth token (saved with mode 0600)");
-        return Ok(token);
-    }
-
-    anyhow::bail!(
-        "no auth token found. Run `aws-nix-cache serve` first to generate one, \
-         or pass --auth-token / set AWS_NIX_CACHE_AUTH_TOKEN"
-    )
-}
-
-fn validate_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        addr.ip().is_loopback(),
-        "refusing to bind to non-loopback address {addr} — \
-         this would expose AWS credentials to the network. \
-         Use 127.0.0.1 or [::1]"
-    );
-    Ok(())
+fn current_uid() -> u32 {
+    // Safety: getuid() is always safe — no failure modes, no pointers
+    unsafe { libc::getuid() }
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────
@@ -203,83 +122,84 @@ fn format_expiry(t: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-// ── HTTP handlers ────────────────────────────────────────────────────────
+// ── Server ───────────────────────────────────────────────────────────────
 
-async fn health() -> &'static str {
-    "ok"
-}
+async fn handle_connection(
+    mut stream: UnixStream,
+    sdk_config: &aws_config::SdkConfig,
+) -> anyhow::Result<()> {
+    let provider = sdk_config
+        .credentials_provider()
+        .ok_or_else(|| anyhow::anyhow!("no credentials provider configured"))?;
 
-async fn credentials(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    // Auth token is always required — checked via constant-time comparison
-    let provided = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !constant_time_eq(provided.as_bytes(), state.auth_token.as_bytes()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing authorization token",
-        )
-            .into_response();
-    }
+    let creds = provider
+        .provide_credentials()
+        .await
+        .map_err(|e| anyhow::anyhow!("credential error: {e}"))?;
 
-    let provider = match state.sdk_config.credentials_provider() {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no credentials provider configured",
-            )
-                .into_response();
-        }
+    let response = CredentialProcessResponse {
+        version: 1,
+        access_key_id: creds.access_key_id().to_string(),
+        secret_access_key: creds.secret_access_key().to_string(),
+        session_token: creds.session_token().map(|s| s.to_string()),
+        expiration: creds.expiry().map(format_expiry),
     };
 
-    match provider.provide_credentials().await {
-        Ok(creds) => {
-            tracing::debug!(access_key_id = creds.access_key_id(), "serving credentials");
-            let response = CredentialResponse {
-                access_key_id: creds.access_key_id().to_string(),
-                secret_access_key: creds.secret_access_key().to_string(),
-                token: creds.session_token().map(|s| s.to_string()),
-                expiration: creds.expiry().map(format_expiry),
-            };
-            Json(response).into_response()
-        }
-        Err(e) => {
-            tracing::error!("failed to provide credentials: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("credential error: {e}"),
-            )
-                .into_response()
-        }
-    }
+    let json = serde_json::to_string(&response)?;
+    stream.write_all(json.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
-/// Constant-time byte comparison to prevent timing attacks on the auth token.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
-// ── Subcommand implementations ───────────────────────────────────────────
-
-async fn run_serve(
-    bind: SocketAddr,
-    auth_token: Option<String>,
-    token_file: Option<PathBuf>,
+async fn accept_loop(
+    listener: UnixListener,
+    sdk_config: Arc<aws_config::SdkConfig>,
+    my_uid: u32,
 ) -> anyhow::Result<()> {
-    validate_loopback(&bind)?;
+    loop {
+        let (stream, _) = listener.accept().await?;
 
-    let auth_token = resolve_token(auth_token, token_file, true)?;
+        // ── SO_PEERCRED: kernel-enforced UID check ──────────────────
+        // Only allow:
+        //   UID 0     — root (nix-daemon)
+        //   our UID   — the user who started the proxy
+        // Everything else is rejected before any data is exchanged.
+        let cred = stream.peer_cred()?;
+        let peer_uid = cred.uid();
+        if peer_uid != 0 && peer_uid != my_uid {
+            tracing::warn!(
+                peer_uid,
+                peer_pid = ?cred.pid(),
+                "rejected connection from unauthorized UID"
+            );
+            continue;
+        }
 
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        tracing::debug!(peer_uid, peer_pid = ?cred.pid(), "accepted connection");
 
+        let sdk_config = Arc::clone(&sdk_config);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, &sdk_config).await {
+                tracing::error!("connection error: {e}");
+            }
+        });
+    }
+}
+
+async fn run_serve(socket_path: PathBuf) -> anyhow::Result<()> {
+    ensure_socket_dir(&socket_path)?;
+
+    let listener = UnixListener::bind(&socket_path)?;
+
+    // Socket: owner + group readable (0660).
+    // Combined with parent dir 0700, only owner + root can connect.
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))?;
+
+    let my_uid = current_uid();
+
+    let sdk_config = Arc::new(aws_config::defaults(BehaviorVersion::latest()).load().await);
+
+    // Best-effort credential validation on startup
     if let Some(provider) = sdk_config.credentials_provider() {
         match provider.provide_credentials().await {
             Ok(creds) => {
@@ -290,32 +210,59 @@ async fn run_serve(
             }
             Err(e) => {
                 tracing::warn!("could not load credentials at startup: {e}");
-                tracing::warn!("the proxy will retry on each request");
+                tracing::warn!("the proxy will retry on each connection");
             }
         }
     } else {
         tracing::warn!(
-            "no credentials provider found — requests will fail until AWS is configured"
+            "no credentials provider found — connections will fail until AWS is configured"
         );
     }
 
-    let state = Arc::new(AppState {
-        sdk_config,
-        auth_token,
-    });
-
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/credentials", get(credentials))
-        .with_state(state);
-
-    tracing::info!(%bind, "starting credential proxy (auth token required)");
+    tracing::info!(
+        socket = %socket_path.display(),
+        uid = my_uid,
+        "listening (accepting UID 0 and UID {my_uid})"
+    );
     tracing::info!("configure nix daemon with: aws-nix-cache print-env");
 
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: clean up socket on Ctrl-C / SIGTERM
+    let socket_path_cleanup = socket_path.clone();
+    tokio::select! {
+        result = accept_loop(listener, sdk_config, my_uid) => result,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+            let _ = std::fs::remove_file(&socket_path_cleanup);
+            Ok(())
+        }
+    }
+}
+
+// ── Client (credential_process) ──────────────────────────────────────────
+
+async fn run_fetch(socket_path: PathBuf) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(&socket_path).await.map_err(|e| {
+        anyhow::anyhow!(
+            "cannot connect to {}: {e}\nIs `aws-nix-cache serve` running?",
+            socket_path.display()
+        )
+    })?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+
+    // Validate JSON before printing (fail fast on corrupt data)
+    let _: serde_json::Value = serde_json::from_slice(&buf)
+        .map_err(|e| anyhow::anyhow!("invalid response from server: {e}"))?;
+
+    // Print to stdout — the AWS SDK reads this as credential_process output
+    use std::io::Write;
+    std::io::stdout().write_all(&buf)?;
+    println!();
     Ok(())
 }
+
+// ── Check ────────────────────────────────────────────────────────────────
 
 async fn run_check() -> anyhow::Result<()> {
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
@@ -343,30 +290,42 @@ async fn run_check() -> anyhow::Result<()> {
     }
 }
 
-fn run_print_env(
-    bind: SocketAddr,
-    auth_token: Option<String>,
-    token_file: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let token = resolve_token(auth_token, token_file, false)?;
-    let uri = format!("http://{bind}/credentials");
+// ── Print config ─────────────────────────────────────────────────────────
 
-    println!("# ── NixOS (configuration.nix) ──────────────────────────────────");
-    println!("# systemd.services.nix-daemon.environment = {{");
-    println!("#   AWS_CONTAINER_CREDENTIALS_FULL_URI = \"{uri}\";");
-    println!("#   AWS_CONTAINER_AUTHORIZATION_TOKEN = \"{token}\";");
-    println!("# }};");
+fn run_print_env(socket_path: PathBuf) {
+    let binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "aws-nix-cache".to_string());
+
+    let sock = socket_path.display();
+
+    println!("# ── NixOS module (configuration.nix) ───────────────────────────");
+    println!("# nix.settings.substituters = [ \"s3://YOUR-BUCKET?region=REGION\" ];");
+    println!("#");
+    println!("# systemd.services.nix-daemon.environment.AWS_CONFIG_FILE =");
+    println!("#   \"/root/.aws/config\";");
+    println!("#");
+    println!("# Then write /root/.aws/config (readable by root only):");
     println!();
-    println!("# ── systemd override (systemctl edit nix-daemon) ───────────────");
+    println!("# ── /root/.aws/config ──────────────────────────────────────────");
+    println!("[default]");
+    println!("credential_process = {binary} fetch --socket {sock}");
+    println!();
+    println!("# ── systemd user service (~/.config/systemd/user/) ─────────────");
+    println!("# [Unit]");
+    println!("# Description=AWS credential proxy for Nix daemon");
+    println!("# After=network.target");
+    println!("#");
     println!("# [Service]");
-    println!("# Environment=\"AWS_CONTAINER_CREDENTIALS_FULL_URI={uri}\"");
-    println!("# Environment=\"AWS_CONTAINER_AUTHORIZATION_TOKEN={token}\"");
-    println!();
-    println!("# ── Shell export ────────────────────────────────────────────────");
-    println!("export AWS_CONTAINER_CREDENTIALS_FULL_URI=\"{uri}\"");
-    println!("export AWS_CONTAINER_AUTHORIZATION_TOKEN=\"{token}\"");
-    Ok(())
+    println!("# ExecStart={binary} serve --socket {sock}");
+    println!("# Restart=always");
+    println!("# RestartSec=5");
+    println!("#");
+    println!("# [Install]");
+    println!("# WantedBy=default.target");
 }
+
+// ── Main ─────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -380,16 +339,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve {
-            bind,
-            auth_token,
-            token_file,
-        } => run_serve(bind, auth_token, token_file).await,
+        Command::Serve { socket } => run_serve(socket.unwrap_or_else(default_socket_path)).await,
+        Command::Fetch { socket } => run_fetch(socket.unwrap_or_else(default_socket_path)).await,
         Command::Check => run_check().await,
-        Command::PrintEnv {
-            bind,
-            auth_token,
-            token_file,
-        } => run_print_env(bind, auth_token, token_file),
+        Command::PrintEnv { socket } => {
+            run_print_env(socket.unwrap_or_else(default_socket_path));
+            Ok(())
+        }
     }
 }
