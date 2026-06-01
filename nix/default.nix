@@ -5,4 +5,6 @@
     ./devshells
     ./checks
   ];
+
+  flake.nixosModules.default = ./nixos;
 }

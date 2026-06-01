@@ -41,20 +41,44 @@ enum Command {
     /// Fetch credentials from the proxy (used as AWS credential_process).
     ///
     /// Connects to the Unix socket, reads credential_process JSON, and prints
-    /// it to stdout. Configure this in the Nix daemon's AWS config:
-    ///
-    ///   [default]
-    ///   credential_process = aws-nix-cache fetch
+    /// it to stdout. The nix-daemon invokes this via credential_process in
+    /// /root/.aws/config.
     Fetch {
         /// Path to the Unix socket.
         #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
         socket: Option<PathBuf>,
     },
 
+    /// Write /root/.aws/config so the nix-daemon can use credential_process.
+    ///
+    /// The profile name must match the `?profile=` parameter in your
+    /// substituter URL (e.g. s3://bucket?profile=nix-cache → --profile nix-cache).
+    /// If your substituter has no `?profile=`, use --profile default.
+    ///
+    /// This writes (or updates) the AWS config for root. Requires root or sudo.
+    /// Works on any distro (NixOS, Ubuntu, Fedora, etc.).
+    Setup {
+        /// AWS profile name — must match the ?profile= in your substituter URL.
+        #[arg(long, default_value = "default")]
+        profile: String,
+
+        /// Path to the Unix socket.
+        #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
+        socket: Option<PathBuf>,
+
+        /// AWS config file to write. Defaults to /root/.aws/config.
+        #[arg(long, default_value = "/root/.aws/config")]
+        config_file: PathBuf,
+
+        /// Print the config to stdout instead of writing the file.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Validate current AWS credentials and print caller identity.
     Check,
 
-    /// Print configuration for the Nix daemon.
+    /// Print full setup instructions for any distro.
     PrintEnv {
         /// Path to the Unix socket.
         #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
@@ -290,6 +314,135 @@ async fn run_check() -> anyhow::Result<()> {
     }
 }
 
+// ── Setup (write /root/.aws/config) ──────────────────────────────────────
+
+fn credential_process_line(socket_path: &Path) -> String {
+    let binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "aws-nix-cache".to_string());
+    let sock = socket_path.display();
+    format!("credential_process = {binary} fetch --socket {sock}")
+}
+
+fn generate_aws_config(profile: &str, socket_path: &Path) -> String {
+    let cred_line = credential_process_line(socket_path);
+    if profile == "default" {
+        format!("[default]\n{cred_line}\n")
+    } else {
+        format!("[profile {profile}]\n{cred_line}\n")
+    }
+}
+
+fn run_setup(
+    profile: String,
+    socket_path: PathBuf,
+    config_file: PathBuf,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let config_content = generate_aws_config(&profile, &socket_path);
+
+    if dry_run {
+        println!("{config_content}");
+        return Ok(());
+    }
+
+    // Check we're root (or tell the user to use sudo)
+    if current_uid() != 0 {
+        eprintln!(
+            "error: setup must run as root to write {}",
+            config_file.display()
+        );
+        eprintln!();
+        eprintln!("  sudo aws-nix-cache setup --profile {profile}");
+        eprintln!();
+        eprintln!("Or preview with --dry-run:");
+        eprintln!("  aws-nix-cache setup --profile {profile} --dry-run");
+        std::process::exit(1);
+    }
+
+    // Create /root/.aws/ with restrictive permissions
+    if let Some(parent) = config_file.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    // If the file exists, try to update just our profile section
+    if config_file.exists() {
+        let existing = std::fs::read_to_string(&config_file)?;
+        let updated = update_profile_in_config(&existing, &profile, &socket_path);
+        std::fs::write(&config_file, &updated)?;
+        eprintln!("updated profile [{profile}] in {}", config_file.display());
+    } else {
+        std::fs::write(&config_file, &config_content)?;
+        eprintln!("created {}", config_file.display());
+    }
+
+    std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600))?;
+
+    eprintln!();
+    eprintln!("next steps:");
+    eprintln!("  1. run `aws-nix-cache serve` as your user");
+    eprintln!("  2. restart nix-daemon: sudo systemctl restart nix-daemon");
+    Ok(())
+}
+
+/// Update or append a profile section in an existing AWS config file.
+/// Preserves all other content.
+fn update_profile_in_config(existing: &str, profile: &str, socket_path: &Path) -> String {
+    let section_header = if profile == "default" {
+        "[default]".to_string()
+    } else {
+        format!("[profile {profile}]")
+    };
+
+    let cred_line = credential_process_line(socket_path);
+    let mut result = String::new();
+    let mut in_our_section = false;
+    let mut wrote_our_section = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == section_header {
+            // Start of our section — write the replacement
+            result.push_str(&section_header);
+            result.push('\n');
+            result.push_str(&cred_line);
+            result.push('\n');
+            in_our_section = true;
+            wrote_our_section = true;
+            continue;
+        }
+
+        // Detect start of a different section
+        if trimmed.starts_with('[') && in_our_section {
+            in_our_section = false;
+        }
+
+        // Skip lines from our old section
+        if in_our_section {
+            continue;
+        }
+
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    // If the profile wasn't found, append it
+    if !wrote_our_section {
+        if !result.ends_with('\n') && !result.is_empty() {
+            result.push('\n');
+        }
+        result.push('\n');
+        result.push_str(&section_header);
+        result.push('\n');
+        result.push_str(&cred_line);
+        result.push('\n');
+    }
+
+    result
+}
+
 // ── Print config ─────────────────────────────────────────────────────────
 
 fn run_print_env(socket_path: PathBuf) {
@@ -299,22 +452,41 @@ fn run_print_env(socket_path: PathBuf) {
 
     let sock = socket_path.display();
 
-    println!("# ── NixOS module (configuration.nix) ───────────────────────────");
-    println!("# nix.settings.substituters = [ \"s3://YOUR-BUCKET?region=REGION\" ];");
+    println!("# ── Quick setup (any distro: Ubuntu, Fedora, NixOS, ...) ───────");
     println!("#");
-    println!("# systemd.services.nix-daemon.environment.AWS_CONFIG_FILE =");
-    println!("#   \"/root/.aws/config\";");
+    println!("# 1. Configure root's AWS config (matches ?profile= in substituter URL):");
+    println!("#    sudo aws-nix-cache setup --profile nix-cache");
     println!("#");
-    println!("# Then write /root/.aws/config (readable by root only):");
+    println!("# 2. Start the proxy as your user:");
+    println!("#    aws-nix-cache serve");
+    println!("#");
+    println!("# 3. Restart the daemon:");
+    println!("#    sudo systemctl restart nix-daemon");
     println!();
-    println!("# ── /root/.aws/config ──────────────────────────────────────────");
-    println!("[default]");
+    println!("# ── /root/.aws/config (generated by `setup`) ───────────────────");
+    println!("[profile nix-cache]");
     println!("credential_process = {binary} fetch --socket {sock}");
     println!();
-    println!("# ── systemd user service (~/.config/systemd/user/) ─────────────");
+    println!("# ── /etc/nix/nix.conf or /etc/nix/conf.d/substituters.conf ─────");
+    println!("# extra-substituters = s3://YOUR-BUCKET?region=REGION&profile=nix-cache");
+    println!("# extra-trusted-public-keys = YOUR-KEY");
+    println!();
+    println!("# ── NixOS / system-manager module ──────────────────────────────");
+    println!("# imports = [ inputs.aws-nix-cache.nixosModules.default ];");
+    println!("#");
+    println!("# services.aws-nix-cache = {{");
+    println!("#   enable = true;");
+    println!("#   package = inputs.aws-nix-cache.packages.${{system}}.default;");
+    println!("#   user = \"your-username\";");
+    println!("#   profile = \"nix-cache\";");
+    println!("#   substituters = [ \"s3://bucket?region=eu-west-3&profile=nix-cache\" ];");
+    println!("#   trustedPublicKeys = [ \"cache:AAAA...=\" ];");
+    println!("# }};");
+    println!();
+    println!("# ── systemd user service (optional, for auto-start) ────────────");
+    println!("# ~/.config/systemd/user/aws-nix-cache.service");
     println!("# [Unit]");
     println!("# Description=AWS credential proxy for Nix daemon");
-    println!("# After=network.target");
     println!("#");
     println!("# [Service]");
     println!("# ExecStart={binary} serve --socket {sock}");
@@ -341,6 +513,17 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { socket } => run_serve(socket.unwrap_or_else(default_socket_path)).await,
         Command::Fetch { socket } => run_fetch(socket.unwrap_or_else(default_socket_path)).await,
+        Command::Setup {
+            profile,
+            socket,
+            config_file,
+            dry_run,
+        } => run_setup(
+            profile,
+            socket.unwrap_or_else(default_socket_path),
+            config_file,
+            dry_run,
+        ),
         Command::Check => run_check().await,
         Command::PrintEnv { socket } => {
             run_print_env(socket.unwrap_or_else(default_socket_path));
