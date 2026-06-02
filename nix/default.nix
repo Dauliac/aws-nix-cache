@@ -7,4 +7,5 @@
   ];
 
   flake.nixosModules.default = ./nixos;
+  flake.homeManagerModules.default = ./home-manager;
 }

@@ -88,6 +88,25 @@ enum Command {
         aws_profile: Option<String>,
     },
 
+    /// Install a systemd user service for `aws-nix-cache serve`.
+    ///
+    /// Works on any distro with systemd (Ubuntu, Fedora, NixOS, etc.).
+    /// Writes ~/.config/systemd/user/aws-nix-cache.service, then runs
+    /// daemon-reload and enables the service.
+    InstallService {
+        /// Path to the Unix socket.
+        #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
+        socket: Option<PathBuf>,
+
+        /// AWS profile to read credentials from.
+        #[arg(long)]
+        aws_profile: Option<String>,
+
+        /// Print the unit file to stdout instead of installing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Print full setup instructions for any distro.
     PrintEnv {
         /// Path to the Unix socket.
@@ -463,6 +482,88 @@ fn update_profile_in_config(existing: &str, profile: &str, socket_path: &Path) -
     result
 }
 
+// ── Install systemd user service ─────────────────────────────────────────
+
+fn generate_unit_file(socket_path: &Path, aws_profile: Option<&str>) -> String {
+    let binary = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "aws-nix-cache".to_string());
+    let sock = socket_path.display();
+
+    let mut exec = format!("{binary} serve --socket {sock}");
+    if let Some(profile) = aws_profile {
+        exec.push_str(&format!(" --aws-profile {profile}"));
+    }
+
+    format!(
+        "\
+[Unit]
+Description=AWS credential proxy for Nix daemon
+Documentation=https://github.com/Dauliac/aws-nix-cache
+
+[Service]
+ExecStart={exec}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"
+    )
+}
+
+fn run_install_service(
+    socket_path: PathBuf,
+    aws_profile: Option<String>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let unit = generate_unit_file(&socket_path, aws_profile.as_deref());
+
+    if dry_run {
+        println!("{unit}");
+        return Ok(());
+    }
+
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("HOME not set — cannot determine user systemd path"))?;
+    let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+    let unit_path = unit_dir.join("aws-nix-cache.service");
+
+    std::fs::create_dir_all(&unit_dir)?;
+    std::fs::write(&unit_path, &unit)?;
+    eprintln!("wrote {}", unit_path.display());
+
+    // daemon-reload + enable + start
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    if let Err(e) = reload {
+        eprintln!("warning: systemctl daemon-reload failed: {e}");
+        eprintln!("run manually: systemctl --user daemon-reload");
+    }
+
+    let enable = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "aws-nix-cache.service"])
+        .status();
+    match enable {
+        Ok(s) if s.success() => {
+            eprintln!("service enabled and started");
+        }
+        Ok(s) => {
+            eprintln!("warning: systemctl enable --now exited with {s}");
+            eprintln!("run manually: systemctl --user enable --now aws-nix-cache.service");
+        }
+        Err(e) => {
+            eprintln!("warning: could not run systemctl: {e}");
+            eprintln!("run manually:");
+            eprintln!("  systemctl --user daemon-reload");
+            eprintln!("  systemctl --user enable --now aws-nix-cache.service");
+        }
+    }
+
+    Ok(())
+}
+
 // ── Print config ─────────────────────────────────────────────────────────
 
 fn run_print_env(socket_path: PathBuf) {
@@ -545,6 +646,15 @@ async fn main() -> anyhow::Result<()> {
             profile,
             socket.unwrap_or_else(default_socket_path),
             config_file,
+            dry_run,
+        ),
+        Command::InstallService {
+            socket,
+            aws_profile,
+            dry_run,
+        } => run_install_service(
+            socket.unwrap_or_else(default_socket_path),
+            aws_profile,
             dry_run,
         ),
         Command::Check { aws_profile } => run_check(aws_profile).await,
