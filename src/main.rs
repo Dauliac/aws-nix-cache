@@ -36,6 +36,12 @@ enum Command {
         /// Defaults to $XDG_RUNTIME_DIR/aws-nix-cache/credentials.sock
         #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
         socket: Option<PathBuf>,
+
+        /// AWS profile to read credentials from (your user profile, not the
+        /// daemon profile). Maps to AWS_PROFILE. Required if your default
+        /// profile has no credentials (e.g. SSO with AWS_DEFAULT_PROFILE).
+        #[arg(long, env = "AWS_PROFILE")]
+        aws_profile: Option<String>,
     },
 
     /// Fetch credentials from the proxy (used as AWS credential_process).
@@ -76,7 +82,11 @@ enum Command {
     },
 
     /// Validate current AWS credentials and print caller identity.
-    Check,
+    Check {
+        /// AWS profile to use for credential resolution.
+        #[arg(long, env = "AWS_PROFILE")]
+        aws_profile: Option<String>,
+    },
 
     /// Print full setup instructions for any distro.
     PrintEnv {
@@ -132,6 +142,16 @@ fn ensure_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
 fn current_uid() -> u32 {
     // Safety: getuid() is always safe — no failure modes, no pointers
     unsafe { libc::getuid() }
+}
+
+// ── AWS config ───────────────────────────────────────────────────────────
+
+async fn load_sdk_config(aws_profile: Option<&str>) -> aws_config::SdkConfig {
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+    if let Some(profile) = aws_profile {
+        loader = loader.profile_name(profile);
+    }
+    loader.load().await
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────
@@ -210,7 +230,7 @@ async fn accept_loop(
     }
 }
 
-async fn run_serve(socket_path: PathBuf) -> anyhow::Result<()> {
+async fn run_serve(socket_path: PathBuf, aws_profile: Option<String>) -> anyhow::Result<()> {
     ensure_socket_dir(&socket_path)?;
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -221,7 +241,7 @@ async fn run_serve(socket_path: PathBuf) -> anyhow::Result<()> {
 
     let my_uid = current_uid();
 
-    let sdk_config = Arc::new(aws_config::defaults(BehaviorVersion::latest()).load().await);
+    let sdk_config = Arc::new(load_sdk_config(aws_profile.as_deref()).await);
 
     // Best-effort credential validation on startup
     if let Some(provider) = sdk_config.credentials_provider() {
@@ -288,8 +308,8 @@ async fn run_fetch(socket_path: PathBuf) -> anyhow::Result<()> {
 
 // ── Check ────────────────────────────────────────────────────────────────
 
-async fn run_check() -> anyhow::Result<()> {
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+async fn run_check(aws_profile: Option<String>) -> anyhow::Result<()> {
+    let sdk_config = load_sdk_config(aws_profile.as_deref()).await;
     let sts = aws_sdk_sts::Client::new(&sdk_config);
 
     match sts.get_caller_identity().send().await {
@@ -511,7 +531,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { socket } => run_serve(socket.unwrap_or_else(default_socket_path)).await,
+        Command::Serve {
+            socket,
+            aws_profile,
+        } => run_serve(socket.unwrap_or_else(default_socket_path), aws_profile).await,
         Command::Fetch { socket } => run_fetch(socket.unwrap_or_else(default_socket_path)).await,
         Command::Setup {
             profile,
@@ -524,7 +547,7 @@ async fn main() -> anyhow::Result<()> {
             config_file,
             dry_run,
         ),
-        Command::Check => run_check().await,
+        Command::Check { aws_profile } => run_check(aws_profile).await,
         Command::PrintEnv { socket } => {
             run_print_env(socket.unwrap_or_else(default_socket_path));
             Ok(())
