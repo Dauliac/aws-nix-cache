@@ -21,6 +21,12 @@ let
     if cfg.socketPath != null
     then cfg.socketPath
     else "%t/aws-nix-cache/credentials.sock";
+
+  # Resolved path for session variables (%t is only valid in systemd units)
+  resolvedCredentialsFile =
+    if cfg.credentialsFile != null
+    then builtins.replaceStrings ["%t"] ["\${XDG_RUNTIME_DIR}"] cfg.credentialsFile
+    else null;
 in
 {
   options.services.aws-nix-cache = {
@@ -78,6 +84,11 @@ in
   };
 
   config = mkIf cfg.enable {
+    # Nix client also needs credentials for S3 substituter access
+    home.sessionVariables = mkIf (resolvedCredentialsFile != null) {
+      AWS_SHARED_CREDENTIALS_FILE = resolvedCredentialsFile;
+    };
+
     systemd.user.services.aws-nix-cache = {
       Unit = {
         Description = "AWS credential proxy for Nix daemon";
