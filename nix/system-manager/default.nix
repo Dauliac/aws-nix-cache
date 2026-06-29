@@ -19,7 +19,7 @@ let
   credentialsFile =
     if cfg.credentialsFile != null
     then cfg.credentialsFile
-    else "/etc/nix/aws-nix-cache-credentials";
+    else "/run/user/${toString cfg.uid}/aws-nix-cache/credentials";
 in
 {
   options.services.aws-nix-cache = {

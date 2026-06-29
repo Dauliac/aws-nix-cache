@@ -52,10 +52,11 @@ in
 
     credentialsFile = mkOption {
       type = types.nullOr types.str;
-      default = "/etc/nix/aws-nix-cache-credentials";
+      default = "%t/aws-nix-cache/credentials";
       description = ''
         Path to write AWS credentials for the nix-daemon's C++ SDK.
         The daemon reads this via AWS_SHARED_CREDENTIALS_FILE.
+        Uses %t (XDG_RUNTIME_DIR) by default — root can read it.
         Set to null to disable credentials file sync.
       '';
     };
