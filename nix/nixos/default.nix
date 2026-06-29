@@ -1,8 +1,8 @@
 # NixOS / system-manager module for aws-nix-cache.
 #
 # Works on NixOS and on non-NixOS distros via system-manager.
-# Configures the nix-daemon to fetch AWS credentials from the
-# aws-nix-cache Unix socket proxy via credential_process.
+# Configures the nix-daemon to read AWS credentials from a file
+# written by `aws-nix-cache serve --credentials-file`.
 #
 # Usage:
 #   services.aws-nix-cache = {
@@ -19,21 +19,10 @@ let
   inherit (lib) mkOption mkEnableOption mkIf types;
   cfg = config.services.aws-nix-cache;
 
-  socketPath =
-    if cfg.socketPath != null
-    then cfg.socketPath
-    else "/run/user/${toString config.users.users.${cfg.user}.uid}/aws-nix-cache/credentials.sock";
-
-  profileHeader =
-    if cfg.profile == "default"
-    then "[default]"
-    else "[profile ${cfg.profile}]";
-
-  # Written to the nix store — root reads it via AWS_CONFIG_FILE.
-  awsConfigFile = pkgs.writeText "aws-nix-cache-config" ''
-    ${profileHeader}
-    credential_process = ${cfg.package}/bin/aws-nix-cache fetch --socket ${socketPath}
-  '';
+  credentialsFile =
+    if cfg.credentialsFile != null
+    then cfg.credentialsFile
+    else "/etc/nix/aws-nix-cache-credentials";
 in
 {
   options.services.aws-nix-cache = {
@@ -48,14 +37,13 @@ in
       type = types.str;
       description = ''
         User account whose AWS credentials to proxy.
-        The socket path defaults to /run/user/<UID>/aws-nix-cache/credentials.sock.
         This user must run `aws-nix-cache serve` (manually or via a systemd user service).
       '';
     };
 
     profile = mkOption {
       type = types.str;
-      default = "default";
+      default = "nix-cache";
       example = "nix-cache";
       description = ''
         AWS profile name. Must match the ?profile= query parameter in your
@@ -64,12 +52,12 @@ in
       '';
     };
 
-    socketPath = mkOption {
+    credentialsFile = mkOption {
       type = types.nullOr types.str;
       default = null;
       description = ''
-        Override the Unix socket path. When null (default), derived from
-        the user option: /run/user/<UID>/aws-nix-cache/credentials.sock.
+        Path to the credentials file written by aws-nix-cache serve.
+        When null (default), uses /etc/nix/aws-nix-cache-credentials.
       '';
     };
 
@@ -89,11 +77,12 @@ in
   };
 
   config = mkIf cfg.enable {
-    # Tell the nix-daemon where to find the AWS config with credential_process.
-    # The daemon reads this file as root, resolves the profile, and runs
-    # `aws-nix-cache fetch` which connects to the user's Unix socket.
-    systemd.services.nix-daemon.environment.AWS_CONFIG_FILE =
-      toString awsConfigFile;
+    # Tell the nix-daemon to read credentials from the file written by
+    # aws-nix-cache serve --credentials-file.
+    systemd.services.nix-daemon.environment = {
+      AWS_SHARED_CREDENTIALS_FILE = credentialsFile;
+      AWS_PROFILE = cfg.profile;
+    };
 
     # Add the S3 substituters and their signing keys to nix.conf
     nix.settings = mkIf (cfg.substituters != [ ]) {

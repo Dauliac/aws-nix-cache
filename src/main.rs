@@ -42,6 +42,23 @@ enum Command {
         /// profile has no credentials (e.g. SSO with AWS_DEFAULT_PROFILE).
         #[arg(long, env = "AWS_PROFILE")]
         aws_profile: Option<String>,
+
+        /// Write credentials to this file for the nix-daemon's C++ AWS SDK.
+        ///
+        /// The file is atomically updated every --credentials-refresh-secs
+        /// seconds. The daemon reads it via AWS_SHARED_CREDENTIALS_FILE.
+        /// Set to empty string to disable.
+        #[arg(long, env = "AWS_NIX_CACHE_CREDENTIALS_FILE")]
+        credentials_file: Option<PathBuf>,
+
+        /// AWS profile name written into the credentials file.
+        /// Must match ?profile= in your substituter URL.
+        #[arg(long, default_value = "nix-cache")]
+        credentials_profile: String,
+
+        /// How often to refresh the credentials file (in seconds).
+        #[arg(long, default_value = "300")]
+        credentials_refresh_secs: u64,
     },
 
     /// Fetch credentials from the proxy (used as AWS credential_process).
@@ -249,7 +266,81 @@ async fn accept_loop(
     }
 }
 
-async fn run_serve(socket_path: PathBuf, aws_profile: Option<String>) -> anyhow::Result<()> {
+/// Write credentials to an AWS credentials file that the C++ SDK can read.
+/// Uses atomic write (write to temp + rename) to avoid partial reads.
+fn write_credentials_file(
+    path: &Path,
+    profile: &str,
+    creds: &aws_credential_types::Credentials,
+) -> anyhow::Result<()> {
+    let mut content = format!(
+        "[{profile}]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
+        creds.access_key_id(),
+        creds.secret_access_key(),
+    );
+    if let Some(token) = creds.session_token() {
+        content.push_str(&format!("aws_session_token = {token}\n"));
+    }
+
+    // Atomic write: write to .tmp then rename
+    let tmp = path.with_extension("tmp");
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&tmp, &content)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Background loop that refreshes the credentials file periodically.
+async fn credentials_file_loop(
+    sdk_config: Arc<aws_config::SdkConfig>,
+    path: PathBuf,
+    profile: String,
+    interval_secs: u64,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+    // First tick fires immediately
+    loop {
+        interval.tick().await;
+
+        let provider = match sdk_config.credentials_provider() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("no credentials provider — skipping file refresh");
+                continue;
+            }
+        };
+
+        match provider.provide_credentials().await {
+            Ok(creds) => {
+                if let Err(e) = write_credentials_file(&path, &profile, &creds) {
+                    tracing::error!(path = %path.display(), "failed to write credentials file: {e}");
+                } else {
+                    tracing::info!(
+                        path = %path.display(),
+                        access_key_id = creds.access_key_id(),
+                        "credentials file updated"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("credential refresh failed (will retry): {e}");
+            }
+        }
+    }
+}
+
+async fn run_serve(
+    socket_path: PathBuf,
+    aws_profile: Option<String>,
+    credentials_file: Option<PathBuf>,
+    credentials_profile: String,
+    credentials_refresh_secs: u64,
+) -> anyhow::Result<()> {
     ensure_socket_dir(&socket_path)?;
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -287,7 +378,22 @@ async fn run_serve(socket_path: PathBuf, aws_profile: Option<String>) -> anyhow:
         uid = my_uid,
         "listening (accepting UID 0 and UID {my_uid})"
     );
-    tracing::info!("configure nix daemon with: aws-nix-cache print-env");
+
+    // Spawn background credentials file writer if configured
+    if let Some(creds_path) = credentials_file {
+        tracing::info!(
+            path = %creds_path.display(),
+            profile = %credentials_profile,
+            refresh_secs = credentials_refresh_secs,
+            "credentials file sync enabled"
+        );
+        tokio::spawn(credentials_file_loop(
+            Arc::clone(&sdk_config),
+            creds_path,
+            credentials_profile,
+            credentials_refresh_secs,
+        ));
+    }
 
     // Graceful shutdown: clean up socket on Ctrl-C / SIGTERM
     let socket_path_cleanup = socket_path.clone();
@@ -638,7 +744,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             socket,
             aws_profile,
-        } => run_serve(socket.unwrap_or_else(default_socket_path), aws_profile).await,
+            credentials_file,
+            credentials_profile,
+            credentials_refresh_secs,
+        } => {
+            run_serve(
+                socket.unwrap_or_else(default_socket_path),
+                aws_profile,
+                credentials_file,
+                credentials_profile,
+                credentials_refresh_secs,
+            )
+            .await
+        }
         Command::Fetch { socket } => run_fetch(socket.unwrap_or_else(default_socket_path)).await,
         Command::Setup {
             profile,
