@@ -399,10 +399,13 @@ fn run_setup(
         std::process::exit(1);
     }
 
-    // Create /root/.aws/ with restrictive permissions
+    // Create parent directory only if it doesn't exist.
+    // Never change permissions on existing directories (e.g. /etc/nix/).
     if let Some(parent) = config_file.parent() {
-        std::fs::create_dir_all(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
 
     // If the file exists, try to update just our profile section
