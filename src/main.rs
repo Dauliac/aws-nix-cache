@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::provider::ProvideCredentials;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -59,6 +59,11 @@ enum Command {
         /// How often to refresh the credentials file (in seconds).
         #[arg(long, default_value = "300")]
         credentials_refresh_secs: u64,
+
+        /// How to handle credential errors (e.g. expired tokens).
+        /// silent = skip quietly (debug log only), warn = log warning, error = log error.
+        #[arg(long, default_value = "silent", env = "AWS_NIX_CACHE_ON_CREDENTIAL_ERROR")]
+        on_credential_error: OnCredentialError,
     },
 
     /// Fetch credentials from the proxy (used as AWS credential_process).
@@ -130,6 +135,17 @@ enum Command {
         #[arg(long, env = "AWS_NIX_CACHE_SOCKET")]
         socket: Option<PathBuf>,
     },
+}
+
+/// How to handle credential errors (e.g. expired tokens).
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq)]
+enum OnCredentialError {
+    /// Silently skip — only log at debug level.
+    Silent,
+    /// Log a warning on each failure.
+    Warn,
+    /// Log an error on each failure.
+    Error,
 }
 
 /// AWS credential_process JSON format (Version 1).
@@ -235,6 +251,7 @@ async fn accept_loop(
     listener: UnixListener,
     sdk_config: Arc<aws_config::SdkConfig>,
     my_uid: u32,
+    on_credential_error: OnCredentialError,
 ) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -258,9 +275,20 @@ async fn accept_loop(
         tracing::debug!(peer_uid, peer_pid = ?cred.pid(), "accepted connection");
 
         let sdk_config = Arc::clone(&sdk_config);
+        let on_error = on_credential_error;
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, &sdk_config).await {
-                tracing::error!("connection error: {e}");
+                match on_error {
+                    OnCredentialError::Silent => {
+                        tracing::debug!("connection error: {e}");
+                    }
+                    OnCredentialError::Warn => {
+                        tracing::warn!("connection error: {e}");
+                    }
+                    OnCredentialError::Error => {
+                        tracing::error!("connection error: {e}");
+                    }
+                }
             }
         });
     }
@@ -301,6 +329,7 @@ async fn credentials_file_loop(
     path: PathBuf,
     profile: String,
     interval_secs: u64,
+    on_credential_error: OnCredentialError,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     // First tick fires immediately
@@ -310,7 +339,7 @@ async fn credentials_file_loop(
         let provider = match sdk_config.credentials_provider() {
             Some(p) => p,
             None => {
-                tracing::warn!("no credentials provider — skipping file refresh");
+                tracing::debug!("no credentials provider — skipping file refresh");
                 continue;
             }
         };
@@ -328,7 +357,17 @@ async fn credentials_file_loop(
                 }
             }
             Err(e) => {
-                tracing::warn!("credential refresh failed (will retry): {e}");
+                match on_credential_error {
+                    OnCredentialError::Silent => {
+                        tracing::debug!("credential refresh failed (will retry): {e}");
+                    }
+                    OnCredentialError::Warn => {
+                        tracing::warn!("credential refresh failed (will retry): {e}");
+                    }
+                    OnCredentialError::Error => {
+                        tracing::error!("credential refresh failed (will retry): {e}");
+                    }
+                }
             }
         }
     }
@@ -340,6 +379,7 @@ async fn run_serve(
     credentials_file: Option<PathBuf>,
     credentials_profile: String,
     credentials_refresh_secs: u64,
+    on_credential_error: OnCredentialError,
 ) -> anyhow::Result<()> {
     ensure_socket_dir(&socket_path)?;
 
@@ -392,13 +432,14 @@ async fn run_serve(
             creds_path,
             credentials_profile,
             credentials_refresh_secs,
+            on_credential_error,
         ));
     }
 
     // Graceful shutdown: clean up socket on Ctrl-C / SIGTERM
     let socket_path_cleanup = socket_path.clone();
     tokio::select! {
-        result = accept_loop(listener, sdk_config, my_uid) => result,
+        result = accept_loop(listener, sdk_config, my_uid, on_credential_error) => result,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             let _ = std::fs::remove_file(&socket_path_cleanup);
@@ -747,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
             credentials_file,
             credentials_profile,
             credentials_refresh_secs,
+            on_credential_error,
         } => {
             run_serve(
                 socket.unwrap_or_else(default_socket_path),
@@ -754,6 +796,7 @@ async fn main() -> anyhow::Result<()> {
                 credentials_file,
                 credentials_profile,
                 credentials_refresh_secs,
+                on_credential_error,
             )
             .await
         }
